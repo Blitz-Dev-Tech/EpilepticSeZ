@@ -1,127 +1,121 @@
-# train.py
 import os
-import json
+import copy
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, ConcatDataset
+from torch.utils.data import DataLoader
 
-# ייבוא הקבצים שלנו
+# ייבוא מהקבצים שלנו
 import config
-from utils.dataset import CHBMITDataset, build_global_summary_dict
-
-# !!! חשוב: כאן אתה מייבא את המודל שלך !!!
-# שנה את "StandardCNN" לשם של המחלקה שמוגדרת בקובץ הרשת שלך
+from utils.dataset import EEGProcessedDataset
 from models.spiking_cnn import StandardCNN
 
 
-def load_datasets(json_filename, global_summary):
-    """
-    פונקציה שטוענת רשימת קבצים מ-JSON, יוצרת Dataset לכל קובץ,
-    ומחברת את כולם למחסן נתונים אחד ענק.
-    """
-    json_path = os.path.join(config.SPLITS_DIR, json_filename)
-
-    if not os.path.exists(json_path):
-        raise FileNotFoundError(f"[!] Please run utils/data_splitter.py first! Could not find {json_path}")
-
-    with open(json_path, 'r') as f:
-        file_list = json.load(f)
-
-    datasets = []
-    for rel_path in file_list:
-        full_path = os.path.join(config.DATA_DIR, rel_path)
-        file_name = os.path.basename(rel_path)
-
-        # משיכת זמני ההתקף מהמילון הגלובלי (או רשימה ריקה אם אין)
-        seizure_times = global_summary.get(file_name, [])
-
-        # יצירת ה-Dataset (טוען רק כותרות בשלב זה)
-        ds = CHBMITDataset(
-            edf_path=full_path,
-            seizure_times=seizure_times,
-            window_size_sec=config.WINDOW_SIZE_SEC
-        )
-
-        # מוסיף רק אם הקובץ נטען בהצלחה ויש בו חלונות
-        if len(ds) > 0:
-            datasets.append(ds)
-
-    # מחבר את כולם יחד באופן וירטואלי
-    return ConcatDataset(datasets)
-
-
 def main():
-    # 1. הגדרת כרטיס מסך (GPU) או מעבד (CPU)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # 1. הגדרת מכשיר (GPU אם יש, אחרת CPU)
+    device = torch.device(config.DEVICE if torch.cuda.is_available() else "cpu")
     print(f"[*] Training on device: {device}")
 
-    # 2. בניית המילון שמכיל את כל ההתקפים
-    print("[*] Scanning summary files to build seizure map...")
-    summary_dict = build_global_summary_dict(config.DATA_DIR)
+    # 2. טעינת הנתונים
+    print("[*] Loading processed datasets...")
+    train_dir = os.path.join(config.PROCESSED_DIR, "train")
+    test_dir = os.path.join(config.PROCESSED_DIR, "test")
 
-    # 3. טעינת הנתונים לאימון ומבחן
-    print("[*] Loading datasets... (This maps the files, doesn't load them into RAM yet)")
-    train_dataset = load_datasets('train_files.json', summary_dict)
-    test_dataset = load_datasets('test_files.json', summary_dict)
-
-    print(f"[*] Total Train Windows (4-sec each): {len(train_dataset)}")
-    print(f"[*] Total Test Windows (4-sec each): {len(test_dataset)}")
+    train_dataset = EEGProcessedDataset(train_dir)
+    test_dataset = EEGProcessedDataset(test_dir)
 
     train_loader = DataLoader(train_dataset, batch_size=config.BATCH_SIZE, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=config.BATCH_SIZE, shuffle=False)
 
-    # 4. הגדרת המודל
-    # ודא שה-CNN שלך מצפה ל-23 ערוצים בכניסה!
+    # 3. יצירת המודל
     model = StandardCNN(num_channels=23).to(device)
 
-    # התמודדות עם חוסר איזון: על כל 100 חלונות נורמליים יש אולי חלון התקף אחד.
-    # אנחנו אומרים לרשת: "אם את מפספסת התקף, העונש שלך חמור פי 10!"
-    class_weights = torch.tensor([1.0, 10.0]).to(device)
-    criterion = nn.CrossEntropyLoss(weight=class_weights)
+    criterion = nn.CrossEntropyLoss()
 
-    optimizer = optim.Adam(model.parameters(), lr=config.LEARNING_RATE)
+    # --- תוספת 1: קנסות (Weight Decay) ---
+    # ההגדרה weight_decay=1e-4 אומרת למודל למנוע משקולות קיצוניות
+    optimizer = optim.Adam(model.parameters(), lr=config.LEARNING_RATE, weight_decay=1e-4)
 
-    # 5. לופ האימון
-    print("[*] Starting Training Loop...")
+    # --- תוספת 2: הגדרות עצירה אוטומטית (Early Stopping) ---
+    patience = 25  # כמה אפוקים לחכות בלי שיפור לפני שעוצרים
+    epochs_no_improve = 0
+    best_test_loss = float('inf')
+    best_model_wts = copy.deepcopy(model.state_dict())  # שומר את המצב ההתחלתי
+
+    # 4. לופ האימון
+    print("[*] Starting Training Loop with Early Stopping & Penalties...")
     for epoch in range(config.EPOCHS):
         model.train()
         running_loss = 0.0
         correct = 0
         total = 0
 
+        # שלב אימון (Train)
         for batch_idx, (inputs, labels) in enumerate(train_loader):
-            # העברת הנתונים לכרטיס המסך/מעבד
             inputs, labels = inputs.to(device), labels.to(device)
 
-            # איפוס גרדיאנטים
             optimizer.zero_grad()
-
-            # הרצת הנתונים קדימה ברשת
             outputs = model(inputs)
-
-            # חישוב השגיאה
             loss = criterion(outputs, labels)
 
-            # עדכון המשקולות
             loss.backward()
             optimizer.step()
 
-            # סטטיסטיקות
             running_loss += loss.item()
             _, predicted = outputs.max(1)
             total += labels.size(0)
             correct += predicted.eq(labels).sum().item()
 
-            # הדפסה כל 50 באצ'ים
-            if batch_idx % 50 == 0:
-                print(
-                    f"Epoch [{epoch + 1}/{config.EPOCHS}] | Batch [{batch_idx}/{len(train_loader)}] | Loss: {loss.item():.4f}")
+        train_acc = 100. * correct / total if total > 0 else 0
+        train_loss = running_loss / len(train_loader)
 
-        # סיכום של האפוק
-        epoch_acc = 100. * correct / total
-        epoch_loss = running_loss / len(train_loader)
-        print(f"=== Epoch {epoch + 1} Completed | Avg Loss: {epoch_loss:.4f} | Train Acc: {epoch_acc:.2f}% ===")
+        # שלב בחינה (Test)
+        model.eval()
+        test_running_loss = 0.0
+        test_correct = 0
+        test_total = 0
+        with torch.no_grad():
+            for inputs, labels in test_loader:
+                inputs, labels = inputs.to(device), labels.to(device)
+                outputs = model(inputs)
+
+                # אנחנו עוקבים אחרי ה-Loss של הטסט, לא רק אחרי האחוזים
+                loss = criterion(outputs, labels)
+                test_running_loss += loss.item()
+
+                _, predicted = outputs.max(1)
+                test_total += labels.size(0)
+                test_correct += predicted.eq(labels).sum().item()
+
+        test_acc = 100. * test_correct / test_total if test_total > 0 else 0
+        test_loss = test_running_loss / len(test_loader)
+
+        print(
+            f"=== Epoch {epoch + 1} | Train Acc: {train_acc:.2f}% | Test Acc: {test_acc:.2f}% | Test Loss: {test_loss:.4f} ===")
+
+        # --- הפעלת העצירה האוטומטית ---
+        # אנחנו רוצים שה-Loss (השגיאה) ירד. אם הוא הכי נמוך שהיה לנו - שומרים!
+        if test_loss < best_test_loss:
+            best_test_loss = test_loss
+            best_model_wts = copy.deepcopy(model.state_dict())
+            epochs_no_improve = 0
+            print(f"    [*] New Best Model Saved! (Loss dropped to {best_test_loss:.4f})")
+        else:
+            epochs_no_improve += 1
+            print(f"    [!] No improvement for {epochs_no_improve} epochs.")
+
+        if epochs_no_improve >= patience:
+            print(f"\n[!!!] Early stopping triggered after {epoch + 1} epochs. Stopping training.")
+            break  # עוצר את הלופ הראשי
+
+    # 5. סיום ושמירה סופית
+    # טוענים חזרה את המשקולות הכי טובות שמצאנו לפני שהתחיל ה-Overfitting
+    model.load_state_dict(best_model_wts)
+    print("\n[*] Training Complete. Best model restored.")
+
+    # שומרים את המודל הסופי לדיסק כדי שנוכל להשתמש בו אחר כך
+    torch.save(model.state_dict(), os.path.join(config.BASE_DIR, "saved_models/model_17.pth"))
+    print("[*] Model saved to 'model_17.pth'")
 
 
 if __name__ == "__main__":

@@ -15,6 +15,6 @@ FS = 256         # תדר דגימה
 
 # הגדרות אימון
 BATCH_SIZE = 16
-LEARNING_RATE = 0.001
+LEARNING_RATE = 0.0001
 EPOCHS = 50
 DEVICE = "cuda" # ישונה אוטומטית ל-cpu בתוך הקוד אם אין כרטיס מסך
